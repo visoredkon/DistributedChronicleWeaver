@@ -5,24 +5,23 @@ services:
       dockerfile: docker/aggregator.Dockerfile
     container_name: chronicleweaver-aggregator
     environment:
-      DEDUPLICATION_DB_PATH: /app/data/chronicle.db
+      DATABASE_URL: postgresql://chronicle:chronicle@postgres:5432/chronicle
+      REDIS_URL: redis://redis:6379/0
+      WORKER_COUNT: "4"
     ports:
-      - "8000:8000"
-    volumes:
-      - aggregator-data:/app/data
-    restart: unless-stopped
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()",
-        ]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()" ]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
     networks:
       - chronicleweaver-network
 
@@ -32,19 +31,72 @@ services:
       dockerfile: docker/publisher.Dockerfile
     container_name: chronicleweaver-publisher
     environment:
-      AGGREGATOR_HOST: chronicleweaver-aggregator
-      AGGREGATOR_PORT: 8000
+      AGGREGATOR_URL: http://chronicleweaver-aggregator:8080
+      EVENT_COUNT: "20000"
+      DUPLICATE_RATIO: "0.3"
     depends_on:
       aggregator:
         condition: service_healthy
     restart: on-failure
     networks:
       - chronicleweaver-network
+    profiles:
+      - publisher
+
+  postgres:
+    image: postgres:17-bookworm
+    container_name: chronicleweaver-postgres
+    environment:
+      POSTGRES_USER: chronicle
+      POSTGRES_PASSWORD: chronicle
+      POSTGRES_DB: chronicle
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U chronicle" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - chronicleweaver-network
+
+  redis:
+    image: redis:8-bookworm
+    container_name: chronicleweaver-redis
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - chronicleweaver-network
+
+  k6:
+    image: grafana/k6:latest
+    container_name: chronicleweaver-k6
+    volumes:
+      - ../k6:/scripts:ro
+    environment:
+      AGGREGATOR_URL: http://chronicleweaver-aggregator:8080
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    networks:
+      - chronicleweaver-network
+    command: run /scripts/benchmark.js
+    profiles:
+      - benchmark
 
 networks:
   chronicleweaver-network:
     driver: bridge
 
 volumes:
-  aggregator-data:
+  postgres-data:
+    driver: local
+  redis-data:
     driver: local

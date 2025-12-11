@@ -1,21 +1,25 @@
 [project]
-name = "ChronicleWeaver"
-version = "0.1.0"
-description = "Publish-Subscribe Log Aggregator"
+name = "DistributedChronicleWeaver"
+version = "0.2.0"
+description = "Distributed Publish-Subscribe Log Aggregator"
 readme = "README.md"
 
 requires-python = ">=3.14"
 dependencies = [
-  "aiosqlite>=0.21.0",
   "fastapi[standard]>=0.120.0",
-  "loguru>=0.7.3",
-  "orjson>=3.11.4",
+  "asyncpg>=0.30.0",
+  "redis>=5.2.0",
   "pydantic>=2.12.3",
+  "orjson>=3.11.4",
+  "loguru>=0.7.3",
 ]
 
 [dependency-groups]
 dev = [
   "basedpyright>=1.32.1",
   "pytest>=8.4.2",
+  "pytest-asyncio>=0.25.0",
+  "pytest-cov>=6.0.0",
+  "testcontainers>=4.0.0",
   "ruff>=0.14.2",
 ]

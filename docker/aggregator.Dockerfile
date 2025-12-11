@@ -14,7 +14,10 @@ FROM python:3.14-slim-bookworm
 
 WORKDIR /app
 
-RUN adduser --disabled-password --gecos "" --no-create-home appuser && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    adduser --disabled-password --gecos "" --no-create-home appuser && \
     mkdir -p /app/data && \
     chown -R appuser:appuser /app
 
@@ -27,7 +30,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8080
 
 ENTRYPOINT ["fastapi"]
-CMD ["run", "src/aggregator/app/main.py", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["run", "src/aggregator/app/main.py", "--host", "0.0.0.0", "--port", "8080"]
