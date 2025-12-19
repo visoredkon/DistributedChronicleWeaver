@@ -38,7 +38,7 @@ export function setup() {
 
 export default function () {
     const eventId = `k6-${__VU}-${__ITER}-${Date.now()}`;
-    const isDuplicate = Math.random() < 0.3;
+    const isDuplicate = (__ITER % 10) < 3;
 
     const payload = JSON.stringify({
         events: [{
