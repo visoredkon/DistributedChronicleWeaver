@@ -4,202 +4,298 @@ NIM   : 11221056<br/>
 Kelas : Sistem Parallel dan Terdistribusi B
 
 # Ringkasan Sistem dan Arsitektur
-Sistem **Publish-Subscribe Log Aggregator** dengan **idempotent consumer** dan **deduplication** yang dibangun menggunakan `Python`, `FastAPI`, dan `asyncio`. Sistem dirancang *crash-tolerant* dengan *persistent deduplication store* menggunakan `SQLite`.
+Sistem **Distributed Publish-Subscribe Log Aggregator** dengan **idempotent consumer**, **deduplication**, dan **transaction-based concurrency** yang berjalan dengan Docker Compose.
 
-*Event* yang dikirim oleh *publisher* akan diterima oleh *aggregator* melalui HTTP POST *request*. *Aggregator* menyimpan *event* ke dalam *in-memory queue* dan memprosesnya menggunakan *consumer service*. Untuk mencegah pemrosesan *duplicate events*, sistem menggunakan *persistent deduplication store* yang dibangun dengan `SQLite` yang menyimpan kombinasi unik dari `event_id` dan `topic`.
+*Event* yang dikirim oleh *publisher* akan diterima oleh *aggregator* melalui HTTP POST *request*. *Aggregator* menyimpan *event* ke dalam Redis *queue* dan memprosesnya menggunakan 4 *consumer workers* secara paralel. Untuk mencegah pemrosesan *duplicate events*, sistem menggunakan *persistent deduplication store* yang dibangun dengan PostgreSQL dengan kombinasi unik dari `event_id` dan `topic`.
 
-![ChronicleWeaver Architecture](architecture.svg)
+Detail diagram arsitektur dan komponen dapat dilihat di [README.md](README.md#arsitektur-sistem).
 
-Sistem ChronicleWeaver terdiri dari dua *main services*:
-### 1. Aggregator Service
-*Service* utama yang menerima dan memproses *event* dengan fitur:
-- **Statistics**          : Monitoring *received*, *processed*, dan *dropped events*
-- **Consumer Service**    : *Background worker* yang memproses *event*
-- **Deduplication Store** : *Persistent storage* untuk mencegah *event* duplikat
-- **Event Publisher API** : Menerima *single* atau *batch events* melalui HTTP POST
-- **Event Queue**         : *In-memory queue* untuk *pipelining* antara *publisher* dan *consumer*
-
-### 2. Publisher Service
-*Service* untuk *stress testing* yang mengirim 5000 *events* ke *aggregator* dengan 20% *duplicate events* untuk validasi sistem.
-
-# Keputusan Design
-
-## 1. Idempotency
+# Keputusan Desain
+## 1. Idempotency & Deduplication
 ### Keputusan
-Sistem mengimplementasikan **idempotent consumer** menggunakan *composite key* `(event_id, topic)` untuk *deduplication*.
+Menggunakan **PostgreSQL unique constraint** `(topic, event_id)` dengan pattern `INSERT ... ON CONFLICT DO NOTHING`.
 
 ### Alasan
-- **At-Least-Once Delivery**: Dalam *distributed systems*, *events* dapat dikirim ulang karena *network failures*, *timeouts*, atau *retries*
-- **Data Integrity**: Tanpa *idempotency*, *duplicate events* akan diproses berkali-kali, menyebabkan *inconsistent state*
-- **Simplicity**: Sederhana namun efektif untuk mencegah duplikasi pada *log aggregation*
+- **Atomic**: *Guarantee deduplication* dalam satu SQL *statement*
+- **Concurrent-safe**: *Multiple workers* tidak menghasilkan *race condition*
+- **Persistent**: *State* tersimpan di *database*, *survive restart*
 
 ### Implementasi
-- *Event* dengan `event_id` dan `topic` yang sama dianggap *duplicate*
-- *First-wins policy*: Hanya *event* pertama yang diproses
-- *In-memory set* untuk *fast lookup* dengan *persistent backing* di `SQLite`
+```sql
+INSERT INTO processed_events (event_id, topic, source, payload, timestamp)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (topic, event_id) DO NOTHING
+RETURNING id;
+```
 
-## 2. Deduplication Store
+- Jika `id` returned → *event* baru, diproses
+- Jika `NULL` → duplicate, di-*drop*
+
+## 2. Message Broker: Redis
 ### Keputusan
-Menggunakan **SQLite** sebagai *persistent deduplication store* dengan *in-memory cache*.
+Menggunakan **Redis** sebagai *internal message queue*.
 
 ### Alasan
-- **Crash Tolerance**: *Deduplication state* harus *survive* *service restarts*
-- **Local-Only Requirement**: Tidak menggunakan *external services* (Redis, DynamoDB, etc.)
-- **Performance**: `SQLite` cukup cepat untuk *single-instance*
+- **Decoupling**: Memisahkan API dari *consumer processing*
+- **Reliability**: *Event* tidak hilang jika *consumer busy* atau *down*
+- **Scalability**: *Multiple workers* dapat *consume* secara *parallel*
 
-### Implementasi
-![Deduplication Store](deduplication_store.svg)
+### Pattern
+- **LPUSH**: Publisher menambah *event* ke *queue*
+- **BRPOP**: Consumer mengambil *event* dengan *blocking*
 
-### Schema
-**Table: processed_events**
-- `event_id` (TEXT)
-- `topic` (TEXT)
-- `source` (TEXT)
-- `payload` (TEXT)
-- `timestamp` (TEXT)
-- PRIMARY KEY: `(event_id, topic)`
-
-**Table: stats**
-- `received` (INTEGER)
-- `duplicated_dropped` (INTEGER)
-- `topics` (TEXT/JSON array)
-
-## 3. Ordering
+## 3. Transaction & Isolation Level
 ### Keputusan
-Sistem tidak mengimplementasikan *total ordering*.
+Menggunakan **READ COMMITTED** *isolation level* (default PostgreSQL).
 
 ### Alasan
-- **Performance* vs *Consistency Trade-off**: *Total ordering* memerlukan *serialization*, membuat *bottleneck*
-- **Use Case Nature**: *Log aggregation* tidak selalu memerlukan *strict ordering*
-- **Throughput Priority**: *Better throughput* lebih penting daripada *strict ordering* untuk *monitoring/logging*
+- **Performance**: Tidak memerlukan *strict serialization*
+- **Sufficiency**: *Unique constraint* sudah mencegah *duplicate inserts*
+- **Trade-off**: *Phantom reads possible* tapi *mitigated* oleh *constraint*
 
-## 4. Retry Mechanism
+### Bukti Concurrency Safe
+```
+Test: test_concurrency_duplicate_parallel
+- 20 *parallel requests with same* `event_id`
+- Result: Hanya 1 *event* tersimpan
+- Stats: 1 `unique_processed`, 19 `duplicated_dropped`
+```
+
+## 4. Multi-Worker Consumer
 ### Keputusan
-Tidak melakukan *retry* untuk *event processing*.
+Menggunakan **4 async workers** (*configurable*) yang *consume* dari Redis queue.
 
 ### Alasan
-- **Idempotency**: *Duplicate events* akan di-*drop* secara otomatis
-- **No External Dependencies**: Tidak ada *downstream services* yang perlu *retry*
+- **Throughput**: *Parallel processing* meningkatkan processing rate
+- **Fault isolation**: Satu *worker* *error* tidak mengganggu lainnya
+- **Retry**: *Exponential backoff* untuk *transient failures*
 
-# Analisis Performance dan Metrics
-Berdasarkan *benchmark* yang dilakukan dengan mengirim 5000 *events* dengan rasio duplikasi 20%, sistem menunjukkan performa sebagai berikut:
-
-## Konfigurasi Benchmark
-- **Total Events**: 5000 *events*
-- **Duplicate Ratio**: 20% (1000 *duplicate events*)
-- **Expected Unique Events**: 4000
-- **Batch Size**: 10 *events* per *batch*
-
-## Hasil Evaluasi
-### 1. Throughput Analysis
-Sistem menunjukkan kemampuan *throughput* yang signifikan pada fase *publishing*, namun mengalami penurunan pada fase *processing*:
-- **Total Events Sent**: 5000 *events*
-- **Events Received**: 5000 *events*
-- **Unique Events Processed**: 4000 *events*
-- **Duplicate Events Dropped**: 1000 *events*
-- **Overall Throughput**: 88.95 *events*/detik
-- **Processing Throughput**: 72.09 *events*/detik
-- **Publishing Throughput**: 6870.61 *events*/detik
-
-*Publishing throughput* sebesar 6870.61 *events*/detik menunjukkan bahwa *in-memory queue* sebagai *buffer* antara *publisher* dan *consumer* bekerja dengan efisien. Namun, *processing throughput* sebesar 72.09 *events*/detik menunjukkan *trade-off* yang diambil untuk menjaga *data integrity* melalui *persistent deduplication store* menggunakan `SQLite`, yang mana menambah *overhead* pada setiap operasi *write*.
-
-### 2. Latency Analysis
-Sistem menunjukkan karakteristik *latency* yang berbeda antara fase *publishing* dan *processing*:
-- **Publish Latency**: 0.728 detik
-- **Processing Latency**: 55.485 detik
-- **Total Latency**: 56.213 detik
-- **Average Per-Event Latency**: 13.87 milidetik
-
-*Publish latency* sebesar 0.728 detik untuk 5000 *events* mengkonfirmasi bahwa keputusan untuk tidak mengimplementasikan *total ordering* memungkinkan sistem untuk menghindari *serialization bottleneck*. *Average per-event latency* sebesar 13.87 milidetik menunjukkan bahwa meskipun terdapat *overhead* dari `SQLite` untuk *persistence*, *latency* per-*event* masih dalam rentang yang cukup baik. *Processing latency* yang lebih tinggi mencerminkan *trade-off* antara *performance* dan *crash tolerance*, di mana sistem diprioritaskan untuk menjaga *deduplication state* secara *persistent* agar dapat *survive service restarts*.
-
-### 3. Duplicate Rate Analysis
-Sistem menunjukkan efektivitas mekanisme *deduplication* yang sempurna:
-- **Input Duplicate Ratio**: 20%
-- **Detected Duplicate Rate**: 20%
-- **Expected Unique Events**: 4000 *events*
-- **Actual Unique Events**: 4000 *events*
-- **Deduplication Accuracy**: 100%
-
-Hasil ini mengkonfirmasi bahwa implementasi *idempotent consumer* dengan *composite key* `(event_id, topic)` dan *persistent deduplication store* bekerja dengan sempurna. Semua 1000 *duplicate events* (20% dari 5000 *events*) berhasil dideteksi dan di-*drop* tanpa kehilangan satupun *unique event*. *Deduplication accuracy* 100% menunjukkan bahwa tidak ada *false positives* (menolak *unique events*) maupun *false negatives* (menerima *duplicate events*).
-
-### 4. Data Integrity
-- **Validation Status**: PASSED
-- **Result**: Semua 4000 *unique events* diproses tanpa *data loss*
-
-Sistem berhasil memproses semua *unique events* tanpa kehilangan data, yang mengkonfirmasi bahwa kombinasi *idempotency* dan *deduplication* efektif dalam mencapai *eventual consistency*. Meskipun sistem mengimplementasikan *at-least-once semantics* yang memungkinkan *duplicate events*, mekanisme *deduplication* memastikan bahwa setiap *unique event* hanya diproses satu kali, menjaga *data integrity* dan mencegah *inconsistent state*.
-
-# Keterikatan ke Bab 1-7
-### T1 (Bab 1): Jelaskan karakteristik utama sistem terdistribusi dan *trade-off* yang umum pada desain *Pub-Sub log aggregator*.
-Sistem terdistribusi terdiri atas sistem komputer yang terhubung dalam *network*, di mana *processes* dan *resources* disebar secara *sufficiently* di berbagai mesin (Steen & Tanenbaum, 2023). Karakteristiknya dapat diketahui dari *design goals*-nya. Menurut Steen & Tanenbaum (2023), ada 6 *design goals*, yaitu:
-1. *Resource sharing*: Memfasilitasi akses *seamless* dan penggunaan *remote resources* seperti *storages*, *services*, dan lain-lain.
-2. *Distributed transparency*: Menyembunyikan penyebaran *processes* dan *resources* yang terdistribusi *across multiple computers* dari *end-users* dan *applications*, umumnya diterapkan menggunakan *middleware layer*, dan memiliki beberapa bentuk *transparency*.
-3. *Openness*: Sistem terdistribusi yang menawarkan *components* yang mudah digunakan dan diintegrasikan ke dalam sistem lain, dan sebaliknya. Untuk itu *components* harus mengikuti *standard* seperti Interface Definition Language (IDL).
-4. *Dependability*: Serangkaian persyaratan agar sistem dapat dipercaya, seperti *availability*, *reliability*, *safety*, dan *maintainability*. *Design* ini bergantung pada *fault tolerance*, yaitu penggunaan *redundancy* menyembunyikan *faults*.
-5. *Security*: Prasyarat penting untuk sistem yang *dependable* dan berfokus pada penjaminan *confidentiality* serta *integrity*, keduanya secara langsung terkait dengan *authorized disclosure* dan *access* pada informasi dan *resources*.
-6. *Scalability*: Kemampuan sistem untuk menangani pertumbuhan dalam berbagi dimensi, termasuk *size*, *geographical*, dan *administrative* tanpa penurunan *performance* yang signifikan.
-
-*Trade-off* dari Publish-Subscribe Log Aggregator salah satunya *scalability* yang mudah terkorbankan pada *layer coordination*: implementasi *efficient and scalable distributed event matching* sulit. Jika *filtering* memerlukan *expressive subscriptions*, proses *matching* dapat *bottleneck*. Ketika *security* dan *privacy* (seperti menjaga *mutual anonymity* dan *confidentiality* data dari *untrusted brokers*) dipertimbangkan, timbul *trade-off* pada kompleksitas implementasi, yang mana seringkali memerlukan solusi rumit seperti *searchable encryption* (*PEKS*), yang dapat menciptakan *bottleneck* *performa* tambahan.
-
-### T2 (Bab 2): Bandingkan arsitektur *client-server* vs *publish-subscribe* untuk *aggregator*. Kapan memilih *Pub-Sub*? Berikan alasan teknis.
-Pada *client-server architecture*, *processes* dibagi menjadi dua, yaitu *server* dan *client*. *Server* adalah *process* yang mengimplementasikan *specific service*, misalnya *web server*. *Client* adalah adalah *process* yang me-*request* *service* dari *server* dengan mengirimkan *request* dan *subsequently waiting* untuk *response* dari *server* (Steen & Tanenbaum, 2023). Karena secara inheren *architecture* ini bersifat *synchronous*, maka pada *log aggregator*, *client* sebagai sumber *log events* harus menunggu *response* dari *server* setelah mengirimkan *event*, sehingga dapat menghambat *throughput* dan menambah *latency*. Selain itu, *architecture* ini *tight coupling*, di mana *client* dan *server* harus *up and running* dan saling mengetahui lokasi dan referensi secara eskplisit saat komunikasi terjadi, sehingga mengurangi *scalability* dan *fault tolerance*.
-
-Sedangkan, arsitektur *publish-subscribe* didasarkan pada *message-oriented communication* atau *event-based communication*, yang memisahkan antara *business logic* dan *coordination mechanism* (Steen & Tanenbaum, 2023). Keuntungannya adalah *loose coupling*, di mana *publishers* sebagai sumber *log events* dan *subscribers* sebagai *aggregator* tidak perlu saling mengetahui (*referentially decoupled*). Selain itu, komunikasi dapat *persistent* (bersifat *message-queuing*), di mana pesan disimpan oleh *middleware* sampai berhasil dikirimkan, sehingga *sender* dan *receiver* tidak perlu *up and running* secara bersamaan (*temporally decoupled*).
-
-*Publish-subscribe architecture* dipilih ketika *design goal* sistem adalah untuk mencapai *loose coupling* antar *components*, meningkatkan *scalability*, dan *fault tolerance*. *Architecture* ini menyediakan *decoupling* baik, terutama *referential decoupling*, di mana *publishers* sebagai penerbit tidak perlu memiliki *explicit reference* atau *identifier*, *location*, atau status dari *subscribers* sebagai penerima. Dalam sistem yang besar dan kompleks di mana *processes* bisa *easily join or leave*, *loose coupling* sangat penting untuk meningkatkan *scalability* dan *fault tolerance*. Dalam kasus *log aggregator*, *publish-subscribe architecture* memungkinkan *publishers* untuk mengirim *log events* tanpa perlu menunggu *subscribers* untuk siap menerima.
-
-### T3 (Bab 3): Uraikan *at-least-once* vs *exactly-once delivery semantics*. Mengapa *idempotent consumer* krusial di *presence of retries*?
-*At-least-once semantics* adalah jaminan bahwa sebuah pengiriman pesan akan dieksekusi setidaknya satu kali, namun terdapat kemungkinan pesan yang sama dikirim lebih dari satu kali (Steen & Tanenbaum, 2023). Pendekatan ini digunakan ketika *client* menghadapi *network failures* atau *timeouts* pada sisi *server*, sehingga *client* akan terus mencoba (*retry*) mengirim pesan sampai mendapatkan *response* sukses dari *server*. Namun, pendekatan ini dapat menyebabkan *duplicate messages* yang dapat mengakibatkan *inconsistent state* pada *consumer* jika pesan yang sama diproses lebih dari sekali. Sebaliknya, *exactly-once semantics* menjamin bahwa setiap pesan akan diproses tepat satu kali, tanpa duplikasi. Namun, secara umum, *exactly-once delivery* sangat sulit atau bahkan tidak mungkin dijamin dalam *distributed systems* karena adanya kegagalan *server* dan kehilangan pesan tidak dapat dihindari (Steen & Tanenbaum, 2023).
-
-*Idempotent consumer* krusial di *presence of retries* karena memungkinkan *consumer* untuk memproses pesan yang sama berkali-kali tanpa menimbulkan efek samping atau "kerusakan" pada sistem. Misalnya dalam sistem *log aggregator*, jika sebuah *event* dikirim ulang karena kegagalan jaringan, *idempotent consumer* dapat mengenali bahwa *event* tersebut sudah pernah diproses sebelumnya (misalnya dengan menggunakan `event_id` dan `topic` sebagai unique identifier) dan mengabaikan pemrosesan ulangnya. Dengan demikian, *idempotent consumer* menjaga *data integrity* dan konsistensi sistem meskipun terjadi *retries*.
-
-### T4 (Bab 4): Rancang skema penamaan untuk `topic` dan `event_id` (unik, *collision-resistant*). Jelaskan dampaknya terhadap *dedup*.
-Untuk `topic`, skema penamaan yang efektif adalah *structured naming* yang hierarkis, mirip dengan *Domain Name System* (DNS) atau *file system* (Steen & Tanenbaum, 2023). Skema hierarkis seperti ini memungkinkan *subscriber* untuk membuat *subscription* berdasarkan kategori atau *wildcard* yang mana sangat berguna dalam sistem *topic-based publish-subscribe*.
-Contoh skema penamaan `topic`:
+### Implementation
+```python
+for worker_id in range(worker_count):
+    task = create_task(coro=self.__consume_loop(worker_id))
 ```
-domain.entity.action.version
 
-shipping.order.created.v1
+## 5. Ordering Strategy
+### Keputusan
+**Tidak menjamin total ordering**, fokus pada *eventual consistency*.
+
+### Alasan
+- **Use case**: Log aggregation tidak memerlukan *strict ordering*
+- **Trade-off**: *Total ordering* memerlukan *serialization* (*bottleneck*)
+- **Mitigation**: *Timestamp* disimpan untuk *ordering* saat *query*
+
+# Analisis Performance
+## K6 Load Testing Configuration
+
+| Parameter           | Value      |
+| ------------------- | ---------- |
+| Virtual Users (VUs) | 10         |
+| Duration            | 30 seconds |
+| Duplicate Ratio     | ~30%       |
+| Tool                | Grafana K6 |
+
+## Benchmark Results
+### Summary
+| Metric             | Target        | Actual            | Status        |
+| ------------------ | ------------- | ----------------- | ------------- |
+| **Throughput**     | ≥ 50 events/s | **221.13 events/s** | 4.4x target   |
+| **Duplicate Rate** | ~30%          | **30%**        | Exact match   |
+| **Error Rate**     | < 1%          | **0.00%**         | Zero errors   |
+| **Latency p95**    | < 500ms       | **52.73ms**       | 9.5x threshold|
+| **Checks Passed**  | 100%          | **100%**          | All pass      |
+
+### Detailed Metrics
+| Metric                | Value  |
+| --------------------- | ------ |
+| Total Events Received | 7,748  |
+| Unique Processed      | 5,421  |
+| Duplicates Dropped    | 2,330  |
+| Total Duration        | 35.04s |
+| HTTP Requests         | 8,153  |
+
+### Latency Analysis
+| Percentile   | Response Time |
+| ------------ | ------------- |
+| Average      | 25.79ms       |
+| Median (p50) | 21.30ms       |
+| p90          | 45.57ms       |
+| p95          | 52.73ms       |
+| Max          | 232.33ms      |
+
+### Bukti No Double-Processing (Hasil Uji Konkurensi)
+| Test                                  | Workers | Same Events | Result               |
+| ------------------------------------- | ------- | ----------- | -------------------- |
+| `test_concurrency_duplicate_parallel` | 20      | 20          | 1 unique, 19 dropped |
+| `test_race_condition_same_event`      | 50      | 50          | 1 unique, 49 dropped |
+
+# Keterkaitan ke Bab 1-13
+## T1 (Bab 1): Karakteristik Sistem Terdistribusi dan Trade-off Desain Pub-Sub Aggregator
+Buku *Distributed Systems* mendefinisikan skalabilitas dalam tiga dimensi.
+> "Scalability of a system can be measured along at least three different dimensions... Size scalability: A system can be scalable regarding its size... geographical scalability... administrative scalability." (Steen & Tanenbaum, 2023)
+
+Dalam DistributedChronicleWeaver, fokus utama adalah **size scalability**. Sistem dirancang untuk menangani beban ribuan *events* per detik melalui arsitektur *multi-worker* yang dapat di-*scale* secara horizontal. Jumlah *worker* dapat dikonfigurasi via *environment variable* `WORKER_COUNT` (default: 4) untuk memungkinkan penyesuaian kapasitas tanpa mengubah kode.
+
+*Trade-off* yang diterima adalah mengorbankan sebagian *transparency*. *Client* tidak mendapat konfirmasi instan bahwa *event* sudah tersimpan di *database* (hanya konfirmasi masuk ke *queue*). Ini adalah pilihan desain yang disengaja: *performance transparency* dikorbankan untuk mencapai *throughput* tinggi. *Latency* bervariasi karena *event* harus melewati antrian Redis terlebih dahulu, namun hal ini memungkinkan sistem menangani *burst* trafik tanpa membebani *database* secara langsung.
+
+## T2 (Bab 2): Kapan Memilih Arsitektur Publish–Subscribe Dibanding Client–Server?
+Arsitektur dipilih berdasarkan kebutuhan pemisahan antar komponen.
+> "These semantics permit communication to be decoupled in time... There is thus no need for the receiver to be executing when a message is being sent to its queue." (Steen & Tanenbaum, 2023)
+
+Berbeda dengan arsitektur *request-reply* (Client-Server) yang bersifat sinkron, sistem *log aggregator* ini membutuhkan *decoupling* karena:
+1.  **Space Decoupling**: Publisher tidak perlu mengetahui keberadaan atau jumlah *aggregator workers* yang sedang berjalan. Publisher cukup mengirim ke endpoint `/publish`.
+2.  **Time Decoupling**: Sistem tetap menerima pesan meskipun *consumer* sedang *down* atau *busy*. Redis bertindak sebagai *buffer*, menyangga pesan hingga *worker* siap memprosesnya.
+
+Alasan teknis utama adalah untuk mencegah *backpressure* langsung ke *database* saat terjadi lonjakan trafik (*bursts*). Jika menggunakan arsitektur sinkron, setiap *request* harus menunggu *database* *commit* selesai sebelum response dikirim. Dengan Pub-Sub, publisher mendapat response cepat (event sudah di-*queue*), sementara proses penyimpanan berjalan secara asinkron di *background*.
+
+## T3 (Bab 3): At-Least-Once vs Exactly-Once Delivery; Peran Idempotent Consumer
+Mengenai jaminan pengiriman pesan, sistem menggunakan *at-least-once*. Konsekuensinya adalah potensi duplikasi pesan, sehingga *idempotency* menjadi sangat penting.
+> "When an operation can be repeated multiple times without harm, it is said to be idempotent." (Steen & Tanenbaum, 2023)
+
+Dalam implementasi, operasi `INSERT ... ON CONFLICT DO NOTHING` adalah operasi *idempotent*. Meskipun *network failure* menyebabkan *event* yang sama dikirim ulang, hasil akhir *database* tetap konsisten (satu *record* tersimpan). Berikut potongan kode dari `database.py`:
+```sql
+INSERT INTO processed_events (event_id, topic, source, payload, timestamp)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (topic, event_id) DO NOTHING
+RETURNING id
 ```
-Keuntungan dari penamaan ini, `topic` menjadi `human-friendly` dan memudahkan *name resolution* jika sistem berkembang menjadi lebih besar dan kompleks.
+Klausa `ON CONFLICT DO NOTHING` memastikan bahwa jika kombinasi `(topic, event_id)` sudah ada, operasi diabaikan tanpa *error*. Return *value* `NULL` menandakan duplikat, yang kemudian dicatat ke *audit log* dengan aksi `DROPPED`.
 
-Untuk memastikan keunikan dan *collision-resistance* pada `event_id`, tidak dapat hanya memanfaatkan *sequential IDs* atau *timestamps* sederhana, karena *network latencies* memiliki *natural lower bound* (Steen & Tanenbaum, 2023). Skema yang lebih baik adalah dengan mengombinasikan beberapa elemen unik, seperti misalnya source identifier, timestamp (*Lamport's logical clock* atau *vector clock*), dan *local incremental sequence number* untuk membedakan *event* yang dihasilkan berdekatan dari sumber yang sama. Untuk mencapai *collision-resistant* yang tinggi, hasil kombinasi tersebut perlu di-*hash* menggunakan *cryptographic hash function* seperti SHA-256 yang menghasilkan *digest* `event_id`. Contoh skema penamaan `event_id`:
+## T4 (Bab 4): Skema Penamaan Topic dan Event_ID (Unik, Collision-Resistant) untuk Dedup
+Untuk melakukan deduplikasi yang efektif, diperlukan identitas yang unik.
+> "A true identifier is a name that has the following properties... An identifier refers to at most one entity." (Steen & Tanenbaum, 2023)
+
+Sistem mengadopsi konsep *True Identifier* ini melalui kombinasi `(topic, event_id)`. Skema ini didefinisikan dalam DDL tabel `processed_events`:
+```sql
+CREATE TABLE IF NOT EXISTS processed_events (
+    id SERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    ...
+    UNIQUE (topic, event_id)
+)
 ```
-SHA256(source_id + timestamp + local_sequence_number)
+*Constraint* `UNIQUE (topic, event_id)` menjamin bahwa dalam satu topik, tidak ada dua *event* dengan ID yang sama. Topik merepresentasikan kategori logis (misal: `user-logs`, `system-metrics`), sementara `event_id` adalah identifier unik yang di-*generate* oleh *publisher* (biasanya UUID atau format *custom*). Kombinasi ini memberikan *collision resistance* yang cukup untuk skenario *multi-publisher*.
+
+## T5 (Bab 5): Ordering Praktis (Timestamp + Monotonic Counter); Batasan dan Dampaknya
+Sinkronisasi waktu adalah tantangan utama dalam sistem terdistribusi.
+> "Under these circumstances, external physical clocks are needed." (Steen & Tanenbaum, 2023)
+
+Sistem menggunakan *Physical Clocks* (UTC Timestamp dalam format ISO8601) untuk *approximate ordering* saat *query*. Setiap *event* membawa *field* `timestamp` yang di-*set* oleh *publisher*. Dampak *clock skew* antar mesin *publisher* ditoleransi karena sifat *log aggregator* yang *eventually consistent*.
+
+Untuk kebutuhan *ordering* yang lebih ketat, sistem menyediakan *field* `created_at` (*timestamp* saat *record* masuk ke *database*) sebagai *fallback*. Kombinasi `timestamp` (waktu *event* terjadi) dan `created_at` (waktu penyimpanan) memberikan fleksibilitas dalam *query sorting*.
+
+## T6 (Bab 6): Failure Modes dan Mitigasi (Retry, Backoff, Durable Dedup Store, Crash Recovery)
+Sistem merespons berbagai kegagalan dengan mekanisme *retry* dan *durable storage*.
+> "A crash failure occurs when a server prematurely halts, but was working correctly until it stopped." (Steen & Tanenbaum, 2023)
+
+Publisher menangani *omission failure* dengan mengirim ulang pesan menggunakan *exponential backoff*. Implementasi *retry* ada di `publisher/app/main.py`:
+```python
+for attempt in range(max_retries):
+    try:
+        response = urlopen(url=request, timeout=30)
+        return status_code, response_text
+    except Exception as e:
+        backoff_time = min(2 ** (attempt + 1), 30)  # Exponential backoff, max 30s
+        sleep(backoff_time)
 ```
-Dampak dari skema penamaan yang unik dan *collision-resistant* terhadap *deduplication* adalah untuk mengidentifikasi *duplicate events* dengan akurat, tanpa `event_id` yang unik, *receiver* atau *middleware* akan sulit membedakan antara *new events* dan *duplicate events*. Dengan `event_id` yang unik, *processing* dapat menjadi *idempotent*, di mana *duplicate events* dapat di-*drop* tanpa mempengaruhi *system state*.
+Untuk pemulihan setelah *crash*, sistem menerapkan *backward recovery*:
+> "In backward recovery, the main issue is to bring the system from its present erroneous *state* back into a previously correct state." (Steen & Tanenbaum, 2023)
 
-### T5 (Bab 5): Bahas *ordering*: kapan *total ordering* tidak diperlukan? Usulkan pendekatan praktis (mis. *event timestamp* + *monotonic counter*) dan batasannya.
-*Total ordering* diperlukan untuk memastikan bahwa semua proses *non-faulty* dalam sistem menerima dan memproses serangkaian *events* dalam urutan yang sama seperti dalam *state machine replication* (Steen & Tanenbaum, 2023). Namun, *total ordering* tidak selalu diperlukan, misalnya ketika sistem dapat mentoleransi *weaker consistency*, terutama jika *event* yang terjadi bersifat *concurrent* dan tidak *causally related* (Steen & Tanenbaum, 2023).
+Penggunaan Docker Volumes memastikan data yang sudah di-*checkpoint* ke PostgreSQL tetap tersedia setelah *container* di-*restart*. Volume `postgres_data` menyimpan *state* *database* secara persisten.
 
-Pendekatan praktis untuk mengelola *ordering* adalah *Lamport's Logical Clocks*, pendekatan ini memastikan bahwa jika suatu *event* `a` terjadi sebelum *event* `b` (dilambangkan sebagai `a -> b`), maka *timestamp* dari `a` akan lebih kecil dari *timestamp* dari `b` (Steen & Tanenbaum, 2023). Namun, pendekatan ini memiliki batasan, yaitu tidak dapat menangkap *causality*, misalnya antara *event* `a` dan *event* `b` tidak dapat disimpulkan berhubungan hanya dengan membandingkan nilai waktunya (Steen & Tanenbaum, 2023). Artinya, pendekatan ini hanya memberikan ordering yang konsisten, tetapi tidak memberikan informasi apakah event yang lebih awal diurutkan secara logis tersebut benar-benar menjadi penyebab atau memengaruhi *event* yang terjadi kemudian.
+## T7 (Bab 7): Eventual Consistency pada Aggregator; Peran Idempotency + Dedup
+Dalam konsistensi data, sistem ini berada di sisi *Eventual Consistency*.
+> "Eventual consistency essentially requires only that updates are guaranteed to propagate to all replicas." (Steen & Tanenbaum, 2023)
 
-### T6 (Bab 6): Identifikasi *failure models* (duplikasi, *out-of-order*, *crash*). Jelaskan strategi mitigasi (*retry*, *backoff*, *durable dedup store*).
-*Failure models* seperti *duplication*, *out-of-order delivery*, dan *crash failures* dapat timbul akibat sistem yang *partially synchronous*, di mana batas waktu pengiriman pesan tidak terjamin, dan *failure detection* sering bergantung pada mekanisme *timeout* yang rawan *false positives* (Steen & Tanenbaum, 2023).
-- *Duplication* umumnya terjadi karena *omission failures* pada *network* atau *server*, misalnya ketika *publisher* mengirim pesan, jika *publisher* tidak menerima *acknowledgment* (ACK) dalam batas waktu tertentu, *publisher* akan mengasumsikan pesan tersebut hilang dan otomatis melakukan *retransmission* (Steen & Tanenbaum, 2023). *Retransmission* yang bertujuan untuk menjamin *at-least-once semantics* dapat menyebabkan *subscriber* menerima *log* yang sama lebih dari sekali jika ACK sebelumnya hanya tertunda.
-- *Out-of-order* dapat terjadi meskipun menggunakan protokol komunikasi *point-to-point* yang *reliable* seperti Transmission Control Protocol (TCP), ketika pesan datang dari berbagai *publishers* atau melalui *middleware* yang berbeda, tidak ada jaminan urutan penerimaan sama dengan urutan kejadian sebenarnya (Steen & Tanenbaum, 2023).
-- *Crash failure* terjadi ketika *server* *prematurely halts*, tapi masih bekerja sampai benar-benar berhenti. Aspek penting dari *crash failure* adalah setelah *server* berhenti, tidak ada lagi *response* yang dapat diterima dari *server* (Steen & Tanenbaum, 2023).
+Antara pesan masuk ke Redis dan tersimpan di Postgres, terdapat jeda waktu (*inconsistency window*). Selama jeda ini, query ke `/stats` mungkin belum merefleksikan *event* terbaru. Namun, sistem menjamin bahwa *eventually* semua *event* yang berhasil di-*queue* akan tersimpan di *database*.
 
-Untuk memitigasi *failure models* tersebut, beberapa strategi dapat diterapkan:
-- Untuk mengatasi *omission failures*, *client* atau *publisher* harus menerapkan mekanisme *retry*. Namun, agar *retry* tidak membebani *server*, *exponential backoff* dapat digunakan, di mana waktu tunggu antara *retries* meningkat secara eksponensial setelah setiap kegagalan.
-- Untuk mengatasi *out-of-order*, protokol harus diperkuat untuk *causally ordered multicasting* (menggunakan *vector timestamps*) atau *totally ordered multicasting* (Steen & Tanenbaum, 2023).
-- Untuk mengatasi *crash failures*, penggunaan *durable deduplication store* memungkinkan sistem untuk menyimpan status *deduplication* secara *persistent*, sehingga ketika *server* di-*restart*, sistem dapat melanjutkan dari status terakhir tanpa kehilangan informasi tentang *events* yang sudah diproses.
+*Idempotency* memastikan konvergensi ke *state* yang benar. Meskipun *event* yang sama diproses berkali-kali (akibat *retry* atau *network duplicate*), constraint `UNIQUE (topic, event_id)` mencegah duplikasi data. Hasil akhir selalu konsisten: satu *event* = satu *record*.
 
-### T7 (Bab 7): Definisikan *eventual consistency* pada *aggregator*; jelaskan bagaimana *idempotency* + *dedup* membantu mencapai konsistensi.
-*Eventual consistency* adalah salah satu dari *data-centric consistency model*, *data store* yang *eventually consistent* memiliki properti bahwa, jika tidak ada operasi *write* yang saling bertentangan (*write-write conflicts*) terjadi dalam waktu yang lama, semua replika data akan berangsur-angsur *converge* menjadi salinan yang identik (Steen & Tanenbaum, 2023). Pada *aggregator*, *eventual consistency* berarti meskipun *events* dapat diproses dalam urutan yang berbeda atau beberapa *events* mungkin tertunda, pada akhirnya semua *unique events* yang diterima akan diproses dan menghasilkan hasil yang konsisten.
+## T8 (Bab 8): Desain Transaksi: ACID, Isolation Level, dan Strategi Menghindari Lost-Update
+Integritas data dijamin oleh *database transaction*.
+> "Transactions adhere to the so-called ACID properties: • Atomic: To the outside world, the transaction happens indivisibly" (Steen & Tanenbaum, 2023)
 
-*Idempotency* dan *deduplication* dapat membantu dalam mencapai konsistensi pada *aggregator*. Dengan *idempotent consumer*, meskipun *events* yang sama diterima dan diproses berkali-kali (misalnya karena *retries*), hasil akhir dari pemrosesan tetap konsisten karena efek samping dari pemrosesan ulang diabaikan. Dengan *deduplication store*, sistem dapat mengidentifikasi dan mengabaikan *duplicate events*, sehingga hanya *unique events* yang diproses. Oleh karena itu, gabungan dari kedua mekanisme ini dapat membantu dalam mencapai konsistensi meskipun terjadi *retries* akibat *network failures*, sistem tetap dapat mencapai konsistensi tanpa kehilangan data atau menghasilkan hasil yang tidak konsisten.
+Implementasi ACID dalam sistem:
+**Atomicity**: Setiap penyimpanan *event* dilakukan dalam satu instruksi SQL tunggal. Jika `INSERT` gagal di tengah jalan (misal: koneksi putus), tidak ada data parsial yang tersimpan. Contoh dari `database.py`:
+```sql
+INSERT INTO processed_events (...) VALUES (...) ON CONFLICT DO NOTHING RETURNING id
+```
 
-### T8 (Bab 1-7): Rumuskan metrik evaluasi sistem (*throughput*, *latency*, *duplicate rate*) dan kaitkan ke keputusan desain.
-*Throughput* mengukur jumlah *events* yang dapat diproses sistem per satuan waktu, dan merupakan indikator dari *scalability* sistem (Steen & Tanenbaum, 2023). Pada sistem *log aggregator*, *throughput* tinggi sangat penting karena sistem harus mampu menangani *events* yang banyak dari berbagai *publishers* secara bersamaan. Keputusan desain untuk menggunakan *in-memory queue* sebagai *buffer* antara *publisher* dan *consumer* memungkinkan *aggregator* untuk menerima *events* dengan cepat tanpa memblokir *publishers*, sehingga mampu meningkatkan *throughput*. Namun, terdapat *trade-off* karena mempertimbangkan *deduplication* menggunakan `SQLite` sebagai *persistent store*, yang mana menambah *overhead* pada *processing* dan dapat menurunkan *throughput* dibandingkan jika hanya menggunakan *in-memory storage*.
+**Consistency**: *Constraint* `UNIQUE (topic, event_id)` dan `NOT NULL` pada *field* berguna untuk menjaga *invariant database*.
+**Isolation**: PostgreSQL menggunakan level *Read Committed* secara *default*. Ini mencegah *dirty reads* namun mengizinkan *non-repeatable reads*. *Trade-off* ini diterima untuk performa yang lebih baik.
+**Durability**: Setelah *commit* berhasil, data tersimpan di *disk* PostgreSQL dan dijamin persisten melalui Docker Volume.
+**Lost-Update Prevention**: *Update* statistik menggunakan operasi atomik:
+```sql
+UPDATE stats SET received = received + 1, updated_at = NOW() WHERE id = 1
+```
+Operasi `received + 1` bersifat atomik di level *database*, mencegah *race condition* saat *multiple worker* meng-*update* *counter* secara bersamaan.
 
-*Latency* mengukur waktu yang dibutuhkan dari saat *event* diterima hingga selesai diproses, dan merupakan aspek penting dari *responsiveness* sistem (Steen & Tanenbaum, 2023). *Latency* dapat dipengaruhi oleh berbagai faktor seperti *network delays*, *processing time*, dan *queuing delays*. Keputusan untuk tidak mengimplementasikan *total ordering* pada sistem *aggregator* bertujuan untuk menghindari *serialization* yang dapat menyebabkan *bottleneck* dan meningkatkan *latency*. Selain itu, penggunaan *asynchronous processing* dengan `asyncio` memungkinkan sistem untuk menangani multiple *events* secara *concurrent* tanpa blocking, yang dapat meningkatkan *latency*.
+## T9 (Bab 9): Kontrol Konkurensi: Locking/Unique Constraints/Upsert; Idempotent Write Pattern
+Sistem menggunakan pendekatan optimistik untuk menangani *multi-worker concurrency*.
+> "A second, optimistic, approach is to let the transaction proceed while verification is taking place." (Steen & Tanenbaum, 2023)
 
-*Duplicate rate* mengukur *duplicate events* yang berhasil dideteksi dan di-*drop* oleh sistem, dan merupakan indikator efektivitas mekanisme *deduplication*. Dalam sistem yang mengimplementasikan *at-least-once semantics*, *duplicate events* tidak dapat dihindari akibat *retries* dari *publishers* terjadi *network failures*. Keputusan desain untuk mengimplementasikan *idempotent consumer* dengan *persistent deduplication store* bertujuan untuk mencapai *duplicate rate* yang rendah atau *ideally zero*, sehingga menjaga *data integrity* dan mencegah *inconsistent state*. Penggunaan *composite key* `(event_id, topic)` sebagai *unique identifier* bertujuan agar *aggregator* dapat mendeteksi duplikasi dengan akurat, dan *deduplication persistence store* dengan `SQLite` dapat mempertahankan state meskipun terjadi *crash failures*.
+Alih-alih mengunci tabel di awal (*pessimistic locking*), setiap *worker* mencoba melakukan `INSERT` secara langsung. *Database* yang memverifikasi apakah ada konflik. Jika terjadi duplikasi (`ON CONFLICT`), transaksi tidak error, melainkan mengabaikan operasi tersebut.
 
-# Video Demo
-[Link](https://www.youtube.com/watch?v=Z1eU1rAKpQc)
+**Multi-Worker Architecture** (`consumer.py`):
+```python
+self.__worker_count = int(getenv(key="WORKER_COUNT", default="4"))
 
-[![Demo Video](https://i.ytimg.com/vi/Z1eU1rAKpQc/maxresdefault.jpg)](https://www.youtube.com/watch?v=Z1eU1rAKpQc)
+for worker_id in range(self.__worker_count):
+    task = create_task(coro=self.__consume_loop(worker_id))
+    self.__tasks.append(task)
+```
+Empat *worker* berjalan paralel, masing-masing melakukan `BRPOP` dari Redis *queue*. Saat dua *worker* secara kebetulan mem-*pop* *event* dengan ID yang sama (akibat *duplicate* di *queue*), hanya satu yang berhasil `INSERT`. *Worker* lainnya mendapat *return* `NULL` dan mencatat *event* sebagai `DROPPED`.
+
+**Efisiensi**: Tidak ada *explicit locking* yang menghambat *throughput*. *Database* menangani konflik di level *row* dengan *overhead* minimal.
+
+## T10 (Bab 10–13): Orkestrasi Compose, Keamanan Jaringan Lokal, Persistensi (Volume), Observability
+Implementasi praktis didukung oleh virtualisasi dan orkestrasi *container*.
+> "Virtual machines... allow for the isolation of a complete application and its environment." (Steen & Tanenbaum, 2023)
+
+**Orkestrasi** (`docker-compose.yml`): Tiga *service* (`aggregator`, `postgres`, `redis`) dikelola sebagai satu *unit deployment*. *Dependency* antar *service* didefinisikan eksplisit dengan `depends_on` dan `healthcheck`.
+
+**Keamanan Jaringan**: PostgreSQL dan Redis berada di *network* internal (`chronicle-network`) yang tidak terekspos ke *host*. Hanya Aggregator yang mem-*bind* *port* `8080` ke luar. Ini mencegah akses langsung ke *database* dari luar *container*.
+
+**Persistensi**: Docker Volume `postgres_data` dan `redis_data` memisahkan *storage* dari *compute*. Saat *container* dihapus dan dibuat ulang, data tetap tersimpan.
+
+**Observability**: *Endpoint* `/stats` menyediakan metrik *real-time* (*events received*, *processed*, *dropped*). *Endpoint* `/audit` menyediakan log aktivitas sistem untuk *debugging* dan *monitoring*.
+
+
+# Test Coverage
+## Unit/Integration Tests (17 tests)
+| Category              | Tests | Coverage                                        |
+| --------------------- | ----- | ----------------------------------------------- |
+| Deduplication         | 3     | Single, batch, across topics                    |
+| Persistence           | 2     | After restart, retrievable                      |
+| Concurrency           | 3     | Parallel requests, *duplicate* parallel, stats  |
+| Schema validation     | 8     | Valid, missing fields, wrong types              |
+| Stats consistency     | 3     | Structure, increments, topics                   |
+| Events consistency    | 4     | Structure, filter, count, unique                |
+| Batch stress          | 3     | 20k events, throughput, large payload           |
+| Race condition        | 3     | Same event, stats, data corruption              |
+| Graceful restart      | 2     | Data preserved, dedup works                     |
+| Out-of-order          | 2     | Processing, all stored                          |
+| Retry backoff         | 2     | Valid request, stats accuracy                   |
+| Health endpoints      | 5     | health, ready, root, docs, openapi              |
+| Transaction isolation | 2     | Unique constraint, atomic stats                 |
+| Batch atomic          | 2     | All valid, partial duplicates                   |
+| Edge cases            | 4     | Empty topic, unicode, special chars, long ID    |
+| Integration           | 3     | Full workflow, multiple topics, API consistency |
+| Audit log             | 5     | Processed, dropped, summary, filters            |
+
+**Total: 17 test files, 56+ test functions**
+
+# Kesimpulan
+Sistem DistributedChronicleWeaver berhasil diimplementasikan sebagai multi-*service* Pub-Sub log aggregator dengan:
+1. **Idempotency**: INSERT ON CONFLICT DO NOTHING
+2. **Persistent dedup**: PostgreSQL dengan unique constraints
+3. **Transaction safety**: READ COMMITTED + atomic upserts
+4. **Concurrency handling**: Multi-worker dengan no double-processing
+5. **Message broker**: Redis untuk decoupled processing
+6. **Audit log**: Tracking RECEIVED, QUEUED, PROCESSED, DROPPED
+7. **Performance**: ≥20,000 events dengan ≥30% duplicates
+8. **17 tests**: Comprehensive coverage (56+ test functions)
 
 # Bibliography
-Steen, M. van, & Tanenbaum, A. S. (2023). Distributed Systems (4th ed.). Maarten van Steen. https:// www.distributed-systems.net/index.php/books/ds4/
+Steen, M. van, & Tanenbaum, A. S. (2023). *Distributed Systems* (4th ed.). Maarten van Steen. <https://www.distributed-systems.net/index.php/books/ds4/>

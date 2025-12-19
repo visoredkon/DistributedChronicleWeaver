@@ -1,176 +1,94 @@
-# ChronicleWeaver
+# DistributedChronicleWeaver
 
-Sistem **Publish-Subscribe Log Aggregator** dengan **idempotent consumer** dan **deduplication** yang dibangun menggunakan `Python`, `FastAPI`, dan `asyncio`. Sistem dirancang *crash-tolerant* dengan *persistent deduplication store* menggunakan `SQLite`.
+Sistem *Distributed Publish-Subscribe Log Aggregator* dengan *idempotent consumer*, *deduplication*, dan *transaction-based concurrency* yang berjalan dengan Docker Compose.
 
-## Arsitektur Sistem
-![ChronicleWeaver Architecture](architecture.svg)
+## System Architecture
+```mermaid
+flowchart TB
+    subgraph Docker["Docker Compose Network"]
+        Publisher["Publisher<br/>(Event Generator)"]
 
-Sistem ChronicleWeaver terdiri dari dua *main services*:
-### 1. Aggregator Service
-*Service* utama yang menerima dan memproses *event* dengan fitur:
-- **Statistics**          : Monitoring *received*, *processed*, dan *dropped events*
-- **Consumer Service**    : *Background worker* yang memproses *event*
-- **Deduplication Store** : *Persistent storage* untuk mencegah *event* duplikat
-- **Event Publisher API** : Menerima *single* atau *batch events* melalui HTTP POST
-- **Event Queue**         : *In-memory queue* untuk *pipelining* antara *publisher* dan *consumer*
+        subgraph Aggregator["Aggregator (FastAPI)"]
+            API["REST API<br/>/publish, /events, /stats, /audit"]
+            Consumer["Consumer Workers<br/>(4 async workers)"]
+        end
 
-### 2. Publisher Service
-*Service* untuk *stress testing* yang mengirim 5000 *events* ke *aggregator* dengan 20% *duplicate events* untuk validasi sistem.
+        Redis[("Redis<br/>(Message Broker)")]
+        PostgreSQL[("PostgreSQL<br/>(Persistent Storage)")]
 
-## Asumsi Sistem
-### 1. Lingkungan dan Deployment
-- Semua komponen berjalan di *local environment* menggunakan Docker
-- Sistem dirancang untuk *single instance* (tidak *distributed*)
-- Komunikasi antar *services* menggunakan Docker *internal networking*
+        Publisher -->|"HTTP POST /publish"| API
+        API -->|"LPUSH"| Redis
+        Redis -->|"BRPOP"| Consumer
+        Consumer -->|"INSERT ON CONFLICT"| PostgreSQL
+        API -->|"SELECT"| PostgreSQL
+    end
+```
 
-### 2. Timing dan Synchronization
-- *Timestamp* dikirim oleh *publisher* dan diasumsikan sudah sinkron
-- Tidak ada validasi *timestamp* atau koreksi *clock skew*
-- Sistem menggunakan waktu *host* yang sama untuk semua komponen
+### Components
+| Service    | Image                           | Description                      |
+| ---------- | ------------------------------- | -------------------------------- |
+| Aggregator | `astral/uv:python3.14-bookworm` | API + *Consumer workers*         |
+| Publisher  | `astral/uv:python3.14-bookworm` | *Event generator*                |
+| Broker     | `redis:8-bookworm`              | *Internal message queue*         |
+| Storage    | `postgres:17-bookworm`          | *Persistent deduplication store* |
 
-### 3. Event Delivery dan Ordering
-- *Duplicate events* dapat terjadi karena *network retries* atau *publisher logic*
-- Tidak ada jaminan *ordering* antar *events*
-
-## Build dan Run
-### Menggunakan Docker Compose (*recommended*)
-#### 1. Build Images
-Dari *root directory project*:
+## Build and Run
+### Quick Start (Docker Compose)
 ```fish
+# 1. Build images (optional, karena kalau lompat ke setap 2 otomatis build)
 docker compose -f docker/docker-compose.yml build
-```
 
-Atau *build* dengan *cache bypass*:
-```fish
-docker compose -f docker/docker-compose.yml build --no-cache
-```
-
-#### 2. Run Services
-*Start* semua *services* (*aggregator* + *publisher*):
-```fish
-docker compose -f docker/docker-compose.yml up
-```
-
-*Run* in *background* (*detached mode*):
-```fish
+# 2. Start core services (aggregator, postgres, redis)
 docker compose -f docker/docker-compose.yml up -d
+
+# 3. Run publisher untuk generate events
+docker compose -f docker/docker-compose.yml --profile publisher up publisher
+
+# 4. Run K6 benchmark
+docker compose -f docker/docker-compose.yml --profile benchmark up k6
 ```
 
-#### 3. View Logs
-Lihat *logs* semua *services*:
+### Profiles
+| Profile     | Command                            | Description                                       |
+| ----------- | ---------------------------------- | ------------------------------------------------- |
+| (default)   | `up -d`                            | *Core services*: aggregator, postgres, redis      |
+| `publisher` | `--profile publisher up publisher` | *Event generator* (20,000 events, 30% duplicates) |
+| `benchmark` | `--profile benchmark up k6`        | K6 *load testing*                                 |
+
+### Other Commands
 ```fish
+# View logs
 docker compose -f docker/docker-compose.yml logs -f
-```
 
-Lihat *logs service* spesifik:
-```fish
-docker compose -f docker/docker-compose.yml logs -f aggregator
-docker compose -f docker/docker-compose.yml logs -f publisher
-```
-
-#### 4. Stop Services
-*Stop* tanpa *remove containers*:
-```fish
-docker compose -f docker/docker-compose.yml stop
-```
-
-*Stop* dan *remove containers*:
-```fish
+# Stop services
 docker compose -f docker/docker-compose.yml down
-```
 
-*Stop* dan *remove containers* + *volumes* (hapus data):
-```fish
+# Stop and remove volumes (fresh start)
 docker compose -f docker/docker-compose.yml down -v
 ```
 
-### Menggunakan Docker Manual
-#### 1. Build Aggregator Image
-Dari *root directory project*:
-```fish
-docker build -f docker/aggregator.Dockerfile -t chronicleweaver-aggregator:latest .
-```
-
-#### 2. Build Publisher Image
-```fish
-docker build -f docker/publisher.Dockerfile -t chronicleweaver-publisher:latest .
-```
-
-#### 3. Create Network
-```fish
-docker network create chronicleweaver-network
-```
-
-#### 4. Run Aggregator Container
-```fish
-docker run -d \
-  --name chronicleweaver-aggregator \
-  --network chronicleweaver-network \
-  -p 8000:8000 \
-  -v chronicleweaver-data:/app/data \
-  chronicleweaver-aggregator:latest
-```
-
-#### 5. Run Publisher Container (Stress Test)
-*Wait aggregator ready*, kemudian:
-```fish
-docker run \
-  --name chronicleweaver-publisher \
-  --network chronicleweaver-network \
-  -e AGGREGATOR_HOST=chronicleweaver-aggregator \
-  -e AGGREGATOR_PORT=8000 \
-  chronicleweaver-publisher:latest
-```
-
-### Local Development (Tanpa Docker)
-#### 1. Install Dependencies
-Menggunakan `uv` (recommended):
-```fish
-uv sync
-```
-
-Atau menggunakan `pip`:
-```fish
-pip install -e .
-```
-
-#### 2. Run Aggregator
-```fish
-fastapi dev src/aggregator/app/main.py --host 0.0.0.0 --port 8000
-```
-
-Atau *production mode*:
-```fish
-fastapi run src/aggregator/app/main.py --host 0.0.0.0 --port 8000
-```
-
-#### 3. Run Publisher (Terminal Terpisah)
-```fish
-python -m src.publisher.app.main
-```
-
-Atau dengan environment variables:
-```fish
-AGGREGATOR_HOST=localhost AGGREGATOR_PORT=8000 python -m src.publisher.app.main
-```
+### Access Points
+- **Aggregator API**: <http://localhost:8080>
+- **Health Check**: <http://localhost:8080/health>
+- **API Docs**: <http://localhost:8080/docs>
 
 ## API Endpoints
-### 1. POST `/publish`
-*Publish single* atau *batch events* ke *aggregator*.
+### POST `/publish`
+*Publish events* ke aggregator.
 
-**Request Body:**
+**Request:**
 ```json
 {
   "events": [
     {
-      "event_id": "event-001",
-      "topic": "user-actions",
-      "source": "web-app",
+      "event_id": "unique-id",
+      "topic": "topic-name",
+      "source": "source-service",
       "payload": {
-        "message": "User logged in",
-        "timestamp": "2025-10-28T10:00:00Z"
+        "message": "Event content",
+        "timestamp": "2025-01-01T00:00:00"
       },
-      "timestamp": "2025-10-28T10:00:00Z"
+      "timestamp": "2025-01-01T00:00:00"
     }
   ]
 }
@@ -185,33 +103,19 @@ AGGREGATOR_HOST=localhost AGGREGATOR_PORT=8000 python -m src.publisher.app.main
 }
 ```
 
-### 2. GET `/events?topic={topic}`
-*Retrieve* semua *unique events* untuk *topic* tertentu.
-
-**Query Parameters:**
-- `topic` (*optional*): *Filter events* berdasarkan *topic*. Jika tidak diberikan, *return* semua *events*.
+### GET `/events?topic={topic}`
+*Retrieve events* yang sudah diproses.
 
 **Response:**
 ```json
 {
-  "count": 10,
-  "events": [
-    {
-      "event_id": "event-001",
-      "topic": "user-actions",
-      "source": "web-app",
-      "payload": {
-        "message": "User logged in",
-        "timestamp": "2025-10-28T10:00:00Z"
-      },
-      "timestamp": "2025-10-28T10:00:00Z"
-    }
-  ]
+  "count": 100,
+  "events": [...]
 }
 ```
 
-### 3. GET `/stats`
-*Retrieve system statistics* dan *monitoring information*.
+### GET `/stats`
+*System statistics*.
 
 **Response:**
 ```json
@@ -219,89 +123,124 @@ AGGREGATOR_HOST=localhost AGGREGATOR_PORT=8000 python -m src.publisher.app.main
   "received": 5000,
   "unique_processed": 4000,
   "duplicated_dropped": 1000,
-  "topics": ["user-actions", "system-events"],
+  "topics": ["topic-1", "topic-2"],
   "uptime": 3600
 }
 ```
 
-**Field Explanations:**
-- `received`: Total *events* yang diterima sistem
-- `unique_processed`: Total *unique events* yang berhasil diproses
-- `duplicated_dropped`: Total *duplicate events* yang di-*drop*
-- `topics`: *List* semua *topics* yang pernah diproses
-- `uptime`: *System uptime* dalam *seconds*
+### GET `/health` & `/ready`
+*Health check endpoints* untuk monitoring.
 
-### 4. GET `/health`
-*Health check endpoint* untuk *monitoring*.
+### GET `/audit`
+*Query audit logs* dengan *filters*.
 
-**Response:**
-```json
-{
-  "message": "healthy"
-}
-```
-
-### 5. GET `/`
-*Root endpoint* untuk verifikasi *service running*.
+**Query Parameters:**
+- `action`: Filter by action (RECEIVED, QUEUED, PROCESSED, DROPPED)
+- `topic`: Filter by topic
+- `event_id`: Filter by event_id
+- `from`: Start timestamp (ISO8601)
+- `to`: End timestamp (ISO8601)
+- `limit`: Max records (default 100, max 1000)
 
 **Response:**
 ```json
 {
-  "message": "ChronicleWeaver is running..."
+  "count": 10,
+  "audit_logs": [
+    {
+      "id": 1,
+      "event_id": "event-001",
+      "topic": "topic-1",
+      "action": "PROCESSED",
+      "worker_id": 0,
+      "created_at": "2025-01-01T00:00:00Z"
+    }
+  ]
 }
 ```
 
-### 6. GET `/docs` dan `/redoc`
-*Auto-generated API documentation* menggunakan *Swagger UI* dan *ReDoc*.
+### GET `/audit/summary`
+*Audit summary* per topic dan worker.
 
 ## Environment Variables
-### Aggregator Service
-- `APP_PORT`: Port untuk *aggregator service* (*default*: `8000`)
-- `DEDUPLICATION_DB_PATH`: *Path* untuk SQLite *database* (*default*: `/app/data/chronicle.db`)
+### Aggregator
+| Variable       | Default                                                    | Description             |
+| -------------- | ---------------------------------------------------------- | ----------------------- |
+| `DATABASE_URL` | `postgresql://chronicle:chronicle@postgres:5432/chronicle` | PostgreSQL connection   |
+| `REDIS_URL`    | `redis://redis:6379/0`                                     | Redis connection        |
+| `WORKER_COUNT` | `4`                                                        | Consumer *worker* count |
 
-### Publisher Service
-- `AGGREGATOR_HOST`: *Hostname aggregator service* (*default*: `localhost`)
-- `AGGREGATOR_PORT`: Port *aggregator service* (*default*: `8000`)
-
-### Contoh Kustomisasi
-Buat file `.env` di folder `docker/`:
-
-```env
-APP_PORT=8080
-DEDUPLICATION_DB_PATH=/app/data/chronicle.db
-
-AGGREGATOR_HOST=aggregator
-AGGREGATOR_PORT=8080
-```
-
-Kemudian update `docker/docker-compose.yml` untuk load `.env` file dengan menambahkan:
-```yaml
-services:
-  aggregator:
-    env_file:
-      - .env
-```
+### Publisher
+| Variable          | Default                 | Description              |
+| ----------------- | ----------------------- | ------------------------ |
+| `AGGREGATOR_URL`  | `http://localhost:8080` | Aggregator API URL       |
+| `EVENT_COUNT`     | `20000`                 | Total events to generate |
+| `DUPLICATE_RATIO` | `0.3`                   | Duplicate *event* ratio  |
+| `BATCH_SIZE`      | `1000`                  | Events per batch         |
 
 ## Testing
 ### Run All Tests
 ```fish
-pytest
+# Start services first
+docker compose -f docker/docker-compose.yml up -d
+
+# Run tests
+uv run pytest tests/ -v
 ```
 
-### Run Tests dengan Verbose Output
+### Test Coverage (17 tests)
+| Test File                          | Description                |
+| ---------------------------------- | -------------------------- |
+| `test_01_deduplication.py`         | Deduplication validation   |
+| `test_02_persistence.py`           | Persistence after restart  |
+| `test_03_concurrency.py`           | Multi-worker consistency   |
+| `test_04_schema_validation.py`     | Event schema validation    |
+| `test_05_stats_consistency.py`     | Stats endpoint tests       |
+| `test_06_events_consistency.py`    | Events endpoint tests      |
+| `test_07_batch_stress.py`          | 20,000+ events stress test |
+| `test_08_race_condition.py`        | Race condition prevention  |
+| `test_09_graceful_restart.py`      | Graceful restart handling  |
+| `test_10_out_of_order.py`          | Out-of-order tolerance     |
+| `test_11_retry_backoff.py`         | Retry mechanism tests      |
+| `test_12_health_endpoints.py`      | Health check tests         |
+| `test_13_transaction_isolation.py` | Transaction isolation      |
+| `test_14_batch_atomic.py`          | Batch atomic processing    |
+| `test_15_edge_cases.py`            | Edge cases handling        |
+| `test_16_integration.py`           | Full integration tests     |
+| `test_17_audit_log.py`             | Audit log endpoints        |
+
+## Persistence
+Data disimpan dalam *named volumes*:
+- `postgres-data`: PostgreSQL database
+- `redis-data`: Redis data
+
 ```fish
-pytest -v
+# Verify persistence after restart
+docker compose -f docker/docker-compose.yml down
+docker compose -f docker/docker-compose.yml up -d
+
+# Check stats preserved
+curl http://localhost:8080/stats
 ```
 
-### Run Specific Test File
-```fish
-pytest tests/test_01_deduplication.py
-pytest tests/test_05_batch_stress.py
+## Transaction & Concurrency
+### Isolation Level: READ COMMITTED
+PostgreSQL menggunakan `READ COMMITTED` isolation level dengan:
+- *Unique constraint* `(topic, event_id)` mencegah *duplicate inserts*
+- *Atomic upsert*: `INSERT ... ON CONFLICT DO NOTHING`
+- *Multi-worker consumer* dengan transaksi per-*event*
+
+### Deduplication Pattern
+```sql
+INSERT INTO processed_events (event_id, topic, source, payload, timestamp)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (topic, event_id) DO NOTHING
+RETURNING id;
 ```
 
-### Test Suites
-1. **test_01_deduplication.py**: *Deduplication validation*
-2. **test_02_deduplication_persistance.py**: *Persistence after restart*
-3. **test_03_event_schema_validation.py**: *Schema validation tests*
-4. **test_04_data_consistency.py**: *Data consistency* antara GET `/events` dan `/stats`
-5. **test_05_batch_stress.py**: *Small batch stress tests* untuk mengukur performa
+## Assumptions
+- *Single* PostgreSQL *instance* (no *replication*)
+- *Events* dengan *timestamp* identik tidak dijamin *strict ordering*
+- *Publisher retry* max 5x dengan *exponential backoff*
+- *Consumer workers* default 4 (*configurable* via `WORKER_COUNT`)
+- Semua *services* berjalan di *internal* Docker *network* (no *external dependencies*)
