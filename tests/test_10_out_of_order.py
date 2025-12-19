@@ -1,16 +1,12 @@
 from time import sleep
-from typing import Any
 
-from orjson import loads
-from utils.testing import EventData, get_request, post_request
-
-SERVER_URL = "http://localhost:8080"
+from utils.testing import get_events, post_request
 
 
-def test_out_of_order_processing() -> None:
-    url: str = f"{SERVER_URL}/publish"
+def test_out_of_order_processing(server_url: str) -> None:
+    url = f"{server_url}/publish"
 
-    events: list[EventData] = [
+    events = [
         {
             "event_id": f"order-event-{i}",
             "topic": "order-topic",
@@ -29,22 +25,15 @@ def test_out_of_order_processing() -> None:
 
     sleep(2)
 
-    events_url: str = f"{SERVER_URL}/events?topic=order-topic"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
-
-    events_data: dict[str, Any] = loads(events_response or "{}")
-    assert events_data["count"] >= 10
+    status, events_data = get_events(server_url, topic="order-topic")
+    assert status == 200
+    assert events_data["count"] == 10
 
 
-def test_out_of_order_all_events_stored() -> None:
-    events_url: str = f"{SERVER_URL}/events?topic=order-topic"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
+def test_out_of_order_all_events_stored(server_url: str) -> None:
+    status, events_data = get_events(server_url, topic="order-topic")
+    assert status == 200
 
-    events_data: dict[str, Any] = loads(events_response or "{}")
-
-    event_ids: set[str] = {e["event_id"] for e in events_data["events"]}
-
-    expected_ids: set[str] = {f"order-event-{i}" for i in range(10)}
-    assert expected_ids.issubset(event_ids)
+    event_ids = {e["event_id"] for e in events_data["events"]}
+    expected_ids = {f"order-event-{i}" for i in range(10)}
+    assert expected_ids == event_ids

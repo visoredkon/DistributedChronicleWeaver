@@ -1,81 +1,33 @@
-from time import sleep
-from typing import Any
-
-from orjson import loads
-from utils.testing import EventData, get_request, post_request
-
-SERVER_URL = "http://localhost:8080"
+from utils.testing import create_event, create_events, get_events, publish_events
 
 
-def test_batch_atomic_all_valid() -> None:
-    url: str = f"{SERVER_URL}/publish"
+def test_batch_atomic_all_valid(server_url: str) -> None:
+    events = create_events(count=20, topic="batch-atomic-topic", prefix="batch-atomic")
 
-    events: list[EventData] = [
-        {
-            "event_id": f"batch-atomic-{i}",
-            "topic": "batch-atomic-topic",
-            "source": "test-service",
-            "payload": {
-                "message": f"Batch atomic {i}",
-                "timestamp": "2025-01-01T00:00:00",
-            },
-            "timestamp": "2025-01-01T00:00:00",
-        }
-        for i in range(20)
+    publish_events(server_url, events, wait_seconds=2)
+
+    status, events_data = get_events(server_url, topic="batch-atomic-topic")
+    assert status == 200
+    assert events_data["count"] == 20
+
+
+def test_batch_atomic_partial_duplicates(server_url: str) -> None:
+    unique_events = create_events(
+        count=10, topic="batch-partial-topic", prefix="batch-partial"
+    )
+    duplicate_events = [
+        create_event(
+            event_id=f"batch-partial-{i}",
+            topic="batch-partial-topic",
+            message=f"Batch partial duplicate {i}",
+        )
+        for i in range(5)
     ]
 
-    status, _ = post_request(url, {"events": events})
+    all_events = unique_events + duplicate_events
+
+    publish_events(server_url, all_events, wait_seconds=2)
+
+    status, events_data = get_events(server_url, topic="batch-partial-topic")
     assert status == 200
-
-    sleep(2)
-
-    events_url: str = f"{SERVER_URL}/events?topic=batch-atomic-topic"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
-
-    events_data: dict[str, Any] = loads(events_response or "{}")
-    assert events_data["count"] >= 20
-
-
-def test_batch_atomic_partial_duplicates() -> None:
-    url: str = f"{SERVER_URL}/publish"
-
-    events: list[EventData] = []
-    for i in range(10):
-        events.append(
-            {
-                "event_id": f"batch-partial-{i}",
-                "topic": "batch-partial-topic",
-                "source": "test-service",
-                "payload": {
-                    "message": f"Batch partial {i}",
-                    "timestamp": "2025-01-01T00:00:00",
-                },
-                "timestamp": "2025-01-01T00:00:00",
-            }
-        )
-    for i in range(5):
-        events.append(
-            {
-                "event_id": f"batch-partial-{i}",
-                "topic": "batch-partial-topic",
-                "source": "test-service",
-                "payload": {
-                    "message": f"Batch partial duplicate {i}",
-                    "timestamp": "2025-01-01T00:00:00",
-                },
-                "timestamp": "2025-01-01T00:00:00",
-            }
-        )
-
-    status, _ = post_request(url, {"events": events})
-    assert status == 200
-
-    sleep(2)
-
-    events_url: str = f"{SERVER_URL}/events?topic=batch-partial-topic"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
-
-    events_data: dict[str, Any] = loads(events_response or "{}")
     assert events_data["count"] == 10

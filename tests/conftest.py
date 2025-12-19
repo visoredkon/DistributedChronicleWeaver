@@ -1,57 +1,64 @@
 import sys
 from pathlib import Path
+from typing import Generator
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
+from utils.testing import (
+    fast_reset_environment,
+    is_environment_running,
+    reset_environment,
+    verify_clean_environment,
+)
 
-TEST_DATABASE_URL = "postgresql://chronicle:chronicle@localhost:5432/chronicle_test"
-TEST_REDIS_URL = "redis://localhost:6379/1"
+SERVER_URL = "http://localhost:8080"
+
+
+def _ensure_environment_up() -> None:
+    if is_environment_running(SERVER_URL):
+        return
+
+    success = reset_environment()
+    assert success, "Failed to initialize environment"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def test_session_lifecycle() -> Generator[None, None, None]:
+    _ensure_environment_up()
+    yield
+
+
+@pytest.fixture(scope="module")
+def fresh_environment() -> Generator[str, None, None]:
+    _ensure_environment_up()
+    success = fast_reset_environment()
+    assert success, "Failed to reset environment with truncate/flush"
+
+    is_clean = verify_clean_environment(SERVER_URL)
+    assert is_clean, "Environment is not clean after reset"
+
+    yield SERVER_URL
+
+
+@pytest.fixture(scope="module")
+def restart_environment() -> Generator[str, None, None]:
+    _ensure_environment_up()
+
+    success = fast_reset_environment()
+    assert success, "Failed to reset data with truncate/flush"
+
+    from utils.testing import restart_aggregator_container
+
+    restarted = restart_aggregator_container()
+    assert restarted, "Failed to restart aggregator container"
+
+    is_clean = verify_clean_environment(SERVER_URL)
+    assert is_clean, "Environment is not clean after restart"
+
+    yield SERVER_URL
 
 
 @pytest.fixture
-def event_data() -> dict[str, str | dict[str, str]]:
-    return {
-        "event_id": "test-event-001",
-        "topic": "test-topic",
-        "source": "test-source",
-        "payload": {
-            "message": "Test message",
-            "timestamp": "2025-01-01T00:00:00",
-        },
-        "timestamp": "2025-01-01T00:00:00",
-    }
-
-
-@pytest.fixture
-def batch_events() -> list[dict[str, str | dict[str, str]]]:
-    events: list[dict[str, str | dict[str, str]]] = []
-    for i in range(100):
-        events.append(
-            {
-                "event_id": f"batch-event-{i}",
-                "topic": "batch-topic",
-                "source": "batch-source",
-                "payload": {
-                    "message": f"Batch message {i}",
-                    "timestamp": "2025-01-01T00:00:00",
-                },
-                "timestamp": "2025-01-01T00:00:00",
-            }
-        )
-    return events
-
-
-@pytest.fixture
-def duplicate_events() -> list[dict[str, str | dict[str, str]]]:
-    base_event: dict[str, str | dict[str, str]] = {
-        "event_id": "duplicate-event-001",
-        "topic": "duplicate-topic",
-        "source": "duplicate-source",
-        "payload": {
-            "message": "Duplicate message",
-            "timestamp": "2025-01-01T00:00:00",
-        },
-        "timestamp": "2025-01-01T00:00:00",
-    }
-    return [base_event.copy() for _ in range(10)]
+def server_url(fresh_environment: str) -> str:
+    return fresh_environment

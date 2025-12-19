@@ -1,69 +1,47 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import sleep
-from typing import Any
 
-from orjson import loads
-from utils.testing import EventData, get_request, post_request
-
-SERVER_URL = "http://localhost:8080"
+from utils.testing import create_event, get_events, get_stats, post_request
 
 
-def send_duplicate_event(event_id: str) -> tuple[int | None, str | None]:
-    url: str = f"{SERVER_URL}/publish"
-    event: EventData = {
-        "event_id": event_id,
-        "topic": "race-topic",
-        "source": "test-service",
-        "payload": {
-            "message": "Race condition test",
-            "timestamp": "2025-01-01T00:00:00",
-        },
-        "timestamp": "2025-01-01T00:00:00",
-    }
-    return post_request(url, {"events": [event]})
+def test_race_condition_same_event(server_url: str) -> None:
+    event_id = "race-event-001"
+    event = create_event(
+        event_id=event_id, topic="race-topic", message="Race condition test"
+    )
 
-
-def test_race_condition_same_event() -> None:
-    event_id: str = "race-event-001"
+    def send_event() -> int | None:
+        url = f"{server_url}/publish"
+        status, _ = post_request(url, {"events": [event]})
+        return status
 
     with ThreadPoolExecutor(max_workers=50) as executor:
-        futures = [executor.submit(send_duplicate_event, event_id) for _ in range(50)]
+        futures = [executor.submit(send_event) for _ in range(50)]
         results = [f.result() for f in as_completed(futures)]
 
-    for status, _ in results:
+    for status in results:
         assert status == 200
 
     sleep(3)
 
-    events_url: str = f"{SERVER_URL}/events?topic=race-topic"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
+    status, events_data = get_events(server_url, topic="race-topic")
+    assert status == 200
 
-    events_data: dict[str, Any] = loads(events_response or "{}")
-    race_events: list[dict[str, Any]] = [
-        e for e in events_data["events"] if e["event_id"] == event_id
-    ]
-
+    race_events = [e for e in events_data["events"] if e["event_id"] == event_id]
     assert len(race_events) == 1
 
 
-def test_race_condition_stats_integrity() -> None:
-    stats_url: str = f"{SERVER_URL}/stats"
-    stats_status, stats_response = get_request(stats_url)
-    assert stats_status == 200
-
-    stats: dict[str, Any] = loads(stats_response or "{}")
+def test_race_condition_stats_integrity(server_url: str) -> None:
+    status, stats = get_stats(server_url)
+    assert status == 200
 
     assert stats["received"] >= stats["unique_processed"]
     assert stats["received"] == stats["unique_processed"] + stats["duplicated_dropped"]
 
 
-def test_race_condition_no_data_corruption() -> None:
-    events_url: str = f"{SERVER_URL}/events"
-    events_status, events_response = get_request(events_url)
-    assert events_status == 200
-
-    events_data: dict[str, Any] = loads(events_response or "{}")
+def test_race_condition_no_data_corruption(server_url: str) -> None:
+    status, events_data = get_events(server_url)
+    assert status == 200
 
     for event in events_data["events"]:
         assert "event_id" in event
