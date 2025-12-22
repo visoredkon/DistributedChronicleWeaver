@@ -42,10 +42,10 @@ docker compose -f docker/docker-compose.yml build
 docker compose -f docker/docker-compose.yml up -d
 
 # 3. Run publisher untuk generate events
-docker compose -f docker/docker-compose.yml --profile publisher up publisher
+docker compose -f docker/docker-compose.yml --profile publisher run --rm publisher
 
 # 4. Run K6 benchmark
-docker compose -f docker/docker-compose.yml --profile benchmark up k6
+docker compose -f docker/docker-compose.yml --profile benchmark run --rm k6
 ```
 
 ### Profiles

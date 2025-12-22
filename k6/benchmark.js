@@ -6,8 +6,8 @@ export const options = {
     scenarios: {
         load_test: {
             executor: 'constant-vus',
-            vus: 10,
-            duration: '30s',
+            vus: 20,
+            duration: '60s',
         },
     },
     thresholds: {
